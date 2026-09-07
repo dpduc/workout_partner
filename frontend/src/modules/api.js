@@ -1,8 +1,14 @@
 /**
  * api.js
- * HTTP client for the FastAPI backend.
- * Base URL configurable via VITE_API_URL env var.
+ * Unified data layer for Workout Partner.
+ * Routes through:
+ * 1. Supabase (if configured & authenticated)
+ * 2. FastAPI backend (if running on localhost:8000)
+ * 3. LocalStore (localStorage offline fallback)
  */
+
+import { supabase, isSupabaseConfigured } from './supabase.js';
+import { auth } from './auth.js';
 
 const BASE = import.meta.env.VITE_API_URL ?? '';
 
@@ -24,56 +30,7 @@ async function request(method, path, body = null) {
   return res.json();
 }
 
-const API = {
-  exercises: {
-    /** GET /api/exercises */
-    list: () => request('GET', '/api/exercises'),
-  },
-
-  sessions: {
-    /** POST /api/sessions */
-    create: (notes = '') => request('POST', '/api/sessions', { notes }),
-
-    /** GET /api/sessions?page=1&limit=20 */
-    list: ({ page = 1, limit = 20 } = {}) =>
-      request('GET', `/api/sessions?page=${page}&limit=${limit}`),
-
-    /** GET /api/sessions/:id */
-    get: (id) => request('GET', `/api/sessions/${id}`),
-
-    /** PATCH /api/sessions/:id */
-    update: (id, data) => request('PATCH', `/api/sessions/${id}`, data),
-
-    /** DELETE /api/sessions/:id */
-    delete: (id) => request('DELETE', `/api/sessions/${id}`),
-  },
-
-  sets: {
-    /** POST /api/sessions/:sessionId/sets */
-    add: (sessionId, data) =>
-      request('POST', `/api/sessions/${sessionId}/sets`, data),
-
-    /** PATCH /api/sets/:id */
-    update: (id, data) => request('PATCH', `/api/sets/${id}`, data),
-
-    /** DELETE /api/sets/:id */
-    delete: (id) => request('DELETE', `/api/sets/${id}`),
-  },
-
-  stats: {
-    /** GET /api/stats/summary */
-    summary: () => request('GET', '/api/stats/summary'),
-
-    /** GET /api/stats/weekly */
-    weekly: () => request('GET', '/api/stats/weekly'),
-  },
-};
-
-export default API;
-
 // ── Offline fallback store (localStorage) ───────────────────────────────────
-// Used when backend is not available (development / offline mode).
-
 export const LocalStore = {
   _key: 'wp_sessions',
 
@@ -161,4 +118,256 @@ export const LocalStore = {
 
     return { labels, datasets: [{ exercise: 'All Exercises', data: orderedData }] };
   },
+
+  // Helper to sync local sessions to Supabase when user creates/signs into an account
+  async syncToSupabase(userId) {
+    if (!isSupabaseConfigured || !supabase || !userId) return;
+    const local = this.getSessions();
+    if (!local.length) return;
+
+    for (const s of local) {
+      try {
+        const { data: dbSession, error: sErr } = await supabase
+          .from('workout_sessions')
+          .insert({
+            user_id: userId,
+            started_at: s.started_at,
+            ended_at: s.ended_at,
+            total_reps: s.total_reps || (s.sets ?? []).reduce((acc, x) => acc + (x.reps || 0), 0),
+            notes: s.notes || '',
+          })
+          .select()
+          .single();
+
+        if (sErr || !dbSession) continue;
+
+        if (s.sets?.length) {
+          const setsPayload = s.sets.map((st) => ({
+            session_id: dbSession.id,
+            user_id: userId,
+            exercise_id: st.exercise_slug || String(st.exercise_id),
+            set_number: st.set_number,
+            reps: st.reps,
+            started_at: st.started_at || s.started_at,
+            ended_at: st.ended_at || s.ended_at,
+          }));
+          await supabase.from('workout_sets').insert(setsPayload);
+        }
+      } catch (e) {
+        console.warn('Failed to sync session to Supabase:', e);
+      }
+    }
+  },
 };
+
+// ── Unified API Object ───────────────────────────────────────────────────────
+const API = {
+  exercises: {
+    list: async () => {
+      try { return await request('GET', '/api/exercises'); }
+      catch {
+        return [
+          { id: 1, slug: 'jumping_jack', name: 'Jumping Jacks', category: 'Cardio' },
+          { id: 2, slug: 'squat', name: 'Bodyweight Squats', category: 'Legs' },
+          { id: 3, slug: 'pushup', name: 'Push-ups', category: 'Upper Body' },
+        ];
+      }
+    },
+  },
+
+  sessions: {
+    create: async (notes = '') => {
+      const userState = auth.getUserState();
+      // 1. If Supabase is available and authenticated
+      if (isSupabaseConfigured && supabase && userState.isAuthenticated) {
+        try {
+          const { data, error } = await supabase
+            .from('workout_sessions')
+            .insert({
+              user_id: userState.user.id,
+              notes,
+              started_at: new Date().toISOString(),
+            })
+            .select()
+            .single();
+          if (!error && data) return data;
+        } catch (e) {
+          console.warn('Supabase session create failed, trying fallback:', e);
+        }
+      }
+
+      // 2. Try FastAPI backend
+      try {
+        return await request('POST', '/api/sessions', { notes });
+      } catch {
+        // 3. Fall back to LocalStore
+        const newSession = {
+          id: 'local_' + Date.now(),
+          started_at: new Date().toISOString(),
+          notes,
+          sets: [],
+          total_duration_s: 0,
+        };
+        LocalStore.addSession(newSession);
+        return newSession;
+      }
+    },
+
+    list: async ({ page = 1, limit = 20 } = {}) => {
+      const userState = auth.getUserState();
+      if (isSupabaseConfigured && supabase && userState.isAuthenticated) {
+        try {
+          const from = (page - 1) * limit;
+          const to = from + limit - 1;
+          const { data, count, error } = await supabase
+            .from('workout_sessions')
+            .select('*, sets:workout_sets(*)', { count: 'exact' })
+            .order('started_at', { ascending: false })
+            .range(from, to);
+
+          if (!error && data) {
+            return {
+              items: data.map((d) => ({
+                id: d.id,
+                started_at: d.started_at,
+                ended_at: d.ended_at,
+                total_duration_s: d.ended_at ? Math.round((new Date(d.ended_at) - new Date(d.started_at))/1000) : 0,
+                notes: d.notes,
+                sets: d.sets || [],
+              })),
+              total: count ?? data.length,
+              page,
+              limit,
+            };
+          }
+        } catch (e) {
+          console.warn('Supabase session list failed, fallback to local:', e);
+        }
+      }
+
+      // Try backend
+      try {
+        return await request('GET', `/api/sessions?page=${page}&limit=${limit}`);
+      } catch {
+        // LocalStore
+        const all = LocalStore.getSessions();
+        const start = (page - 1) * limit;
+        return {
+          items: all.slice(start, start + limit),
+          total: all.length,
+          page,
+          limit,
+        };
+      }
+    },
+
+    get: async (id) => {
+      try { return await request('GET', `/api/sessions/${id}`); }
+      catch {
+        return LocalStore.getSessions().find((s) => s.id === id);
+      }
+    },
+
+    update: async (id, data) => {
+      const userState = auth.getUserState();
+      if (isSupabaseConfigured && supabase && userState.isAuthenticated && !String(id).startsWith('local_')) {
+        try {
+          const { error } = await supabase
+            .from('workout_sessions')
+            .update({
+              ended_at: data.ended_at,
+              total_reps: data.total_reps,
+              notes: data.notes,
+            })
+            .eq('id', id);
+          if (!error) return { id, ...data };
+        } catch (e) {
+          console.warn('Supabase session update failed:', e);
+        }
+      }
+
+      try {
+        return await request('PATCH', `/api/sessions/${id}`, data);
+      } catch {
+        return LocalStore.updateSession(id, data);
+      }
+    },
+
+    delete: async (id) => {
+      const userState = auth.getUserState();
+      if (isSupabaseConfigured && supabase && userState.isAuthenticated && !String(id).startsWith('local_')) {
+        try {
+          await supabase.from('workout_sessions').delete().eq('id', id);
+        } catch (e) {
+          console.warn('Supabase delete failed:', e);
+        }
+      }
+
+      try {
+        return await request('DELETE', `/api/sessions/${id}`);
+      } catch {
+        LocalStore.deleteSession(id);
+      }
+    },
+  },
+
+  sets: {
+    add: async (sessionId, data) => {
+      const userState = auth.getUserState();
+      if (isSupabaseConfigured && supabase && userState.isAuthenticated && !String(sessionId).startsWith('local_')) {
+        try {
+          const { data: setRes, error } = await supabase
+            .from('workout_sets')
+            .insert({
+              session_id: sessionId,
+              user_id: userState.user.id,
+              exercise_id: data.exercise_slug || String(data.exercise_id),
+              set_number: data.set_number,
+              reps: data.reps,
+              started_at: new Date().toISOString(),
+              ended_at: new Date().toISOString(),
+            })
+            .select()
+            .single();
+          if (!error && setRes) return setRes;
+        } catch (e) {
+          console.warn('Supabase set insert failed:', e);
+        }
+      }
+
+      try {
+        return await request('POST', `/api/sessions/${sessionId}/sets`, data);
+      } catch {
+        const session = LocalStore.getSessions().find((s) => s.id === sessionId);
+        const currentSets = session?.sets || [];
+        currentSets.push(data);
+        LocalStore.updateSession(sessionId, { sets: currentSets });
+        return data;
+      }
+    },
+
+    update: async (id, data) => {
+      try { return await request('PATCH', `/api/sets/${id}`, data); }
+      catch { return data; }
+    },
+
+    delete: async (id) => {
+      try { return await request('DELETE', `/api/sets/${id}`); }
+      catch { return null; }
+    },
+  },
+
+  stats: {
+    summary: async () => {
+      try { return await request('GET', '/api/stats/summary'); }
+      catch { return LocalStore.getSummary(); }
+    },
+
+    weekly: async () => {
+      try { return await request('GET', '/api/stats/weekly'); }
+      catch { return LocalStore.getWeekly(); }
+    },
+  },
+};
+
+export default API;
