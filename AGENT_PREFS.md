@@ -96,14 +96,6 @@
 - **PostgreSQL**: chạy local (hoặc Docker)
 
 ---
-
-## 📋 Workflow Ưa Thích
-
-1. **Plan trước**: Với task lớn, tạo implementation plan, chờ approve
-2. **Build từng module**: Hoàn chỉnh 1 module trước khi sang module khác
-3. **Test thủ công**: Chạy và kiểm tra trực quan trong browser
-4. **Commit thường xuyên**: Mỗi feature nhỏ = 1 commit có ý nghĩa
-
 ---
 
 ## 📝 Notes Cá Nhân
